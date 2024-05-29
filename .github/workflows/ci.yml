@@ -1,0 +1,33 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v2
+
+    - name: Set up Node.js
+      uses: actions/setup-node@v3
+      with:
+        node-version: '18'
+
+    - name: Install npm dependencies
+      run: |
+        cd test-app
+        npm install
+
+    - name: Run make all
+      run: make all
+
+    - name: Upload screenshot
+      uses: actions/upload-artifact@v3
+      with:
+        name: screenshot
+        path: test-app/output.png

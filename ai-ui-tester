@@ -1,0 +1,142 @@
+#!/bin/env ruby
+
+require 'fileutils'
+require 'net/http'
+require 'optparse'
+require 'base64'
+require 'json'
+require 'yaml'
+
+$options = {}
+OptionParser.new do |opts|
+  opts.banner = "Usage: openai_requester.rb [options]"
+
+  opts.on("--config [CONFIGFILE]", "Test config file") do |test_config|
+    if File.exists?(test_config)
+      $options[:test_config] = test_config
+      $options[:test_state] = ".state.#{test_config}"
+    end
+  end
+
+  opts.on("--token [TOKEN]", "OpenAI token") do |token|
+    $options[:token] = token
+  end
+end.parse!
+
+if $options[:test_config].nil?
+  STDERR.puts "Error: Missing config"
+  exit 1
+end
+
+cfg = YAML.load_file($options[:test_config])
+tests = cfg['tests'].to_a
+
+class TestCtrl
+
+  PROMT_FRAGMENTS = {
+    'SELECT' => "select the lower right of",
+    'CLICK' => "click the lower right of",
+  }
+
+  def initialize(tests)
+    @tests = tests
+    @events = []
+    @perform_cnt = 0
+  end
+
+  def build_eval_prompt(eval_str)
+    "The result is `pass` if:\n```\n" + eval_str + "\n```\nOtherwise it is `fail`.\nCheck and respond with result json!"
+  end
+
+  # build the check prompt that will result in a result json
+  # to check if the action was correct.
+  def build_check_prompt(event_str, step_raw)
+    "Would " + event_str + " " + step_raw + "? Respond with result json!"
+  end
+
+  # buld the action prompt that will result in an event
+  def build_action_prompt(step_raw)
+    step = step_raw.to_s.dup
+    PROMT_FRAGMENTS.each do |k, v|
+      step = step.gsub(k, v)
+    end
+    step + ". Respond with event json!"
+  end
+
+  # TODO More complex event parsing in screenshot.cjs
+  def events_to_clicks
+    clicks = []
+    # ai generated json strings => caution
+    @events.each do |e|
+      event = e['event']
+      next unless event
+      next unless event.class == Hash && event['type'] == 'click'
+
+      sector = event['sector']
+      next unless sector && sector.class == Hash
+      x = sector['x']
+      x ||= sector['X']     
+      y = sector['y']
+      y ||= sector['Y']
+      next unless x && y
+
+      clicks << { 'x' => x, 'y' => y }
+    end
+    clicks
+  end
+
+
+  def move_file_if_exists(source, destination)
+    if File.exist?(source)
+      FileUtils.mv(source, destination)
+      puts "File moved from #{source} to #{destination}"
+    else
+      puts "File not found: #{source}"
+    end
+  end
+
+  def perform(event = nil)
+    @events << event if event
+    Dir.chdir('test-app') do
+      move_file_if_exists('output.png', "step-#{@perform_cnt}.png")
+      `node screenshot.cjs --clicks '#{events_to_clicks.to_json}'`
+    end
+    @perform_cnt += 1
+  end
+
+  def evaluate()
+   #nop
+  end
+
+  def run
+    perform
+
+    @tests.each do |test|
+      steps = test['steps'].to_a
+      steps.each do |step_raw|
+        event = nil
+        result = nil
+        action = build_action_prompt(step_raw)
+        5.times do 
+          event_str = `ruby ./openai-request --token #{$options[:token]} --prompt '#{action}' --png test-app/output.png`
+          prompt = build_check_prompt(event_str, step_raw)
+          result_str = `ruby ./openai-request --token #{$options[:token]} --prompt '#{prompt}' --png test-app/output.png`
+          result = JSON.parse(result_str)
+          if result['result'] == 'pass'
+            event = JSON.parse(event_str)
+            break
+          end
+        end
+
+        perform(event) if result['result'] == 'pass'
+      end
+      prompt = build_eval_prompt(test['eval'].to_s)
+      result_str = `ruby ./openai-request --token #{$options[:token]} --prompt '#{prompt}' --png test-app/output.png`
+      puts result_str
+    end
+  end
+end
+
+
+ctrl = TestCtrl.new(tests)
+ctrl.run

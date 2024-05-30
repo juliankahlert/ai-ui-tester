@@ -1,5 +1,18 @@
 ---
 tests:
-- steps:
+- name: Will Pass
+  uid: test-1
+  steps:
   - CLICK count
   eval: count equals 1
+- name: Will Fail
+  uid: test-2
+  steps:
+  - CLICK count
+  eval: count equals 2
+- name: Will Pass with count 2
+  uid: test-3
+  steps:
+  - CLICK count
+  - CLICK count
+  eval: count is 2

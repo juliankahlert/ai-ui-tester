@@ -108,39 +108,51 @@ class TestCtrl
    #nop
   end
 
+  def prepare_test(test)
+    test['report'] = {
+      'actions' => [],
+      'result' => {},
+    }
+
+    Dir.chdir('test-app') do
+      FileUtils.rm_f("output.png")
+    end
+
+    @perform_cnt = 0
+    @events = []
+    perform(nil, test['uid'])
+  end
+
   def run
     @tests.each do |test|
       3.times do
-        test['report'] = {
-          'actions' => [],
-          'result' => {},
-        }
-
-        Dir.chdir('test-app') do
-          FileUtils.rm_f("output.png")
-        end
-
-        @perform_cnt = 0
-        @events = []
-        perform(nil, test['uid'])
+        prepare_test(test)
 
         steps = test['steps'].to_a
-        steps.each do |step_raw|
+        steps.each do |step|
           event = nil
           result = nil
-          action = build_action_prompt(step_raw)
-          5.times do 
-            event_str = `ruby ./openai-request --token #{$options[:token]} --prompt '#{action}' --png test-app/output.png`
-            prompt = build_check_prompt(event_str, step_raw)
+          3.times do
+            action = build_action_prompt(step['perform'])
+            5.times do
+              event_str = `ruby ./openai-request --token #{$options[:token]} --prompt '#{action}' --png test-app/output.png`
+              prompt = build_check_prompt(event_str, step['perform'])
+              result_str = `ruby ./openai-request --token #{$options[:token]} --prompt '#{prompt}' --png test-app/output.png`
+              result = JSON.parse(result_str)
+              event = JSON.parse(event_str)
+              break if result['result'] == 'pass'
+            end
+            perform(event, test['uid']) if result['result'] == 'pass'
+
+            prompt = build_eval_prompt(step['eval'].to_s)
             result_str = `ruby ./openai-request --token #{$options[:token]} --prompt '#{prompt}' --png test-app/output.png`
             result = JSON.parse(result_str)
-            if result['result'] == 'pass'
-              event = JSON.parse(event_str)
-              break
-            end
+            break if result['result'] == 'pass'
+
+            # perform failed
+            @perform_cnt -= 1
           end
           test['report']['actions'] << event
-          perform(event, test['uid']) if result['result'] == 'pass'
         end
         prompt = build_eval_prompt(test['eval'].to_s)
         result_str = `ruby ./openai-request --token #{$options[:token]} --prompt '#{prompt}' --png test-app/output.png`
@@ -152,7 +164,6 @@ class TestCtrl
     end
   end
 end
-
 
 ctrl = TestCtrl.new(tests)
 ctrl.run

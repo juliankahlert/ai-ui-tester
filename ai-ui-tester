@@ -88,20 +88,20 @@ class TestCtrl
 
   def move_file_if_exists(source, destination)
     if File.exist?(source)
-      FileUtils.mv(source, destination)
+      FileUtils.cp(source, destination)
       puts "File moved from #{source} to #{destination}"
     else
       puts "File not found: #{source}"
     end
   end
 
-  def perform(event = nil)
-    @events << event if event
+  def perform(event = nil, test_id = nil)
     Dir.chdir('test-app') do
-      move_file_if_exists('output.png', "step-#{@perform_cnt}.png")
+      @events << event if event
       `node screenshot.cjs --clicks '#{events_to_clicks.to_json}'`
+      move_file_if_exists('output.png', "#{test_id}-step-#{@perform_cnt}.png") if test_id
+      @perform_cnt += 1
     end
-    @perform_cnt += 1
   end
 
   def evaluate()
@@ -109,35 +109,46 @@ class TestCtrl
   end
 
   def run
-    perform
-
     @tests.each do |test|
-      test['report'] = {
-        'actions' => [],
-        'result' => {},
-      }
-      steps = test['steps'].to_a
-      steps.each do |step_raw|
-        event = nil
-        result = nil
-        action = build_action_prompt(step_raw)
-        5.times do 
-          event_str = `ruby ./openai-request --token #{$options[:token]} --prompt '#{action}' --png test-app/output.png`
-          prompt = build_check_prompt(event_str, step_raw)
-          result_str = `ruby ./openai-request --token #{$options[:token]} --prompt '#{prompt}' --png test-app/output.png`
-          result = JSON.parse(result_str)
-          if result['result'] == 'pass'
-            event = JSON.parse(event_str)
-            break
-          end
+      3.times do
+        test['report'] = {
+          'actions' => [],
+          'result' => {},
+        }
+
+        Dir.chdir('test-app') do
+          FileUtils.rm_f("output.png")
         end
-        test['report']['actions'] << event
-        perform(event) if result['result'] == 'pass'
+
+        @perform_cnt = 0
+        @events = []
+        perform(nil, test['uid'])
+
+        steps = test['steps'].to_a
+        steps.each do |step_raw|
+          event = nil
+          result = nil
+          action = build_action_prompt(step_raw)
+          5.times do 
+            event_str = `ruby ./openai-request --token #{$options[:token]} --prompt '#{action}' --png test-app/output.png`
+            prompt = build_check_prompt(event_str, step_raw)
+            result_str = `ruby ./openai-request --token #{$options[:token]} --prompt '#{prompt}' --png test-app/output.png`
+            result = JSON.parse(result_str)
+            if result['result'] == 'pass'
+              event = JSON.parse(event_str)
+              break
+            end
+          end
+          test['report']['actions'] << event
+          perform(event, test['uid']) if result['result'] == 'pass'
+        end
+        prompt = build_eval_prompt(test['eval'].to_s)
+        result_str = `ruby ./openai-request --token #{$options[:token]} --prompt '#{prompt}' --png test-app/output.png`
+        result = JSON.parse(result_str)
+        test['report']['result'] = result
+        puts result_str
+        break if result['result'] == 'pass'
       end
-      prompt = build_eval_prompt(test['eval'].to_s)
-      result_str = `ruby ./openai-request --token #{$options[:token]} --prompt '#{prompt}' --png test-app/output.png`
-      test['report']['result'] = JSON.parse(result_str)
-      puts result_str
     end
   end
 end

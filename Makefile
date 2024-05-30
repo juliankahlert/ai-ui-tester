@@ -1,3 +1,3 @@
 
 all:
-	make -C test-app screenshot
+	make -C test-app prepare

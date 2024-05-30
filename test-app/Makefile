@@ -1,11 +1,15 @@
 
-.PHONY: install run
+.PHONY: install run prepare
 
 run: install
 	npm run dev
 
 install:
 	npm install
+
+prepare:
+	make run &
+	sleep 10
 
 screenshot:
 	make run &

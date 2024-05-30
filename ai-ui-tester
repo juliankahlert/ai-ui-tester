@@ -112,6 +112,10 @@ class TestCtrl
     perform
 
     @tests.each do |test|
+      test['report'] = {
+        'actions' => [],
+        'result' => {},
+      }
       steps = test['steps'].to_a
       steps.each do |step_raw|
         event = nil
@@ -127,11 +131,12 @@ class TestCtrl
             break
           end
         end
-
+        test['report']['actions'] << event
         perform(event) if result['result'] == 'pass'
       end
       prompt = build_eval_prompt(test['eval'].to_s)
       result_str = `ruby ./openai-request --token #{$options[:token]} --prompt '#{prompt}' --png test-app/output.png`
+      test['report']['result'] = JSON.parse(result_str)
       puts result_str
     end
   end
@@ -140,3 +145,5 @@ end
 
 ctrl = TestCtrl.new(tests)
 ctrl.run
+
+File.open('report.yaml', 'w') {|f| f.write tests.to_yaml }

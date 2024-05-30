@@ -11,7 +11,7 @@ jobs:
 
     steps:
     - name: Checkout repository
-      uses: actions/checkout@v2
+      uses: actions/checkout@v4
 
     - name: Set up Node.js
       uses: actions/setup-node@v3
@@ -26,8 +26,11 @@ jobs:
     - name: Run make all
       run: make all
 
+    - name: Run ai-ui-tester
+      run: ruby ai-ui-tester --config test-001.yaml --token ${{ secrets.OPENAI_TOKEN }}
+
     - name: Upload screenshot
       uses: actions/upload-artifact@v3
       with:
         name: screenshot
-        path: test-app/output.png
+        path: test-app/*.png

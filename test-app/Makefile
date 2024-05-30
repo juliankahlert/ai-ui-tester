@@ -10,4 +10,4 @@ install:
 screenshot:
 	make run &
 	sleep 10
-	node screenshot.cjs --get-args events=#click42-24#click22-44#
+	node screenshot.cjs --clicks '[{"x":12,"y":18},{"x":12,"y":18}]'

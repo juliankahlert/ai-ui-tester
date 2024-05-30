@@ -4,15 +4,18 @@ const sharp = require('sharp');
 const fs = require('fs').promises;
 const path = require('path');
 
+const delay = time => new Promise(resolve => setTimeout(resolve, time));
+
 program
-  .option('--get-args <getargs>', 'GET arguments to append to the URL')
+  .option('--clicks <clicks_json_array>', 'JSON array of clicks')
   .parse(process.argv);
 
 const options = program.opts();
-const baseURL = 'http://localhost:5173/index.html'; // Replace with your base URL
-const url = options.getArgs ? `${baseURL}?${options.getArgs}` : baseURL;
+const baseURL = 'http://localhost:5173/index.html';
+const url = baseURL;
 const screenshotPath = 'tmp.png';
 const gridSvgPath = 'grid.svg';
+const outputPath = 'output.png';
 
 (async () => {
   const browser = await puppeteer.launch();
@@ -22,20 +25,22 @@ const gridSvgPath = 'grid.svg';
 
   await page.goto(url, { waitUntil: 'networkidle2' });
 
-  // Define an array of X-Y coordinates to click
-  const clickCoordinates = [
-    { x: 235, y: 350 },
-    { x: 235, y: 350 },
-    // Add more coordinates as needed
-  ];
+  let clickCoordinates;
+  try {
+    clickCoordinates = JSON.parse(options.clicks);
+  } catch (error) {
+    console.error('Invalid JSON for clicks:', error.message);
+    return;
+  }
 
   // Simulate clicks at each coordinate
   for (const coord of clickCoordinates) {
-    await page.mouse.click(coord.x, coord.y);
-    console.log(`Clicked at (${coord.x}, ${coord.y})`);
+    const x = coord.x * 20
+    const y = coord.y * 20
+    await page.mouse.click(x, y);
+    console.log(`Clicked at (${x}, ${y})`);
 
-    // Add a delay between clicks if needed
-    // await page.waitForTimeout(100);
+    await delay(100);
   }
 
   await page.screenshot({ path: screenshotPath });
@@ -93,7 +98,6 @@ const gridSvgPath = 'grid.svg';
     .toBuffer();
 
   // Save the final image
-  const outputPath = 'output.png';
   await fs.writeFile(outputPath, outputBuffer);
 
   console.log(`Final image saved as ${outputPath}`);

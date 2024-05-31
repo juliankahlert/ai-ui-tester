@@ -6,53 +6,33 @@ const path = require('path');
 
 const delay = time => new Promise(resolve => setTimeout(resolve, time));
 
+let events = []
 program
-  .option('--clicks <clicks_json_array>', 'JSON array of clicks')
+  .option('--tap <click_json>', 'JSON tap event', (evt, _) => {
+    evt = JSON.parse(evt);
+    events = events.concat([{"type":"tap","value":evt}]);
+  }, null)
+  .option('--screen <path>', 'Save screen to path', (evt, _) => {
+    events = events.concat([{"type":"screen","value":evt}]);
+  }, null)
   .parse(process.argv);
 
-const options = program.opts();
+try {
+    const options = program.opts();
+} catch (error) {
+    console.error('Invalid JSON:', error.message);
+    return 1;
+}
+
 const baseURL = 'http://localhost:5173/index.html';
 const url = baseURL;
 const screenshotPath = 'tmp.png';
 const gridSvgPath = 'grid.svg';
 const outputPath = 'output.png';
 
-(async () => {
-  const browser = await puppeteer.launch();
-  const page = await browser.newPage();
-
-  await page.setViewport({ width: 470, height: 470 });
-
-  await page.goto(url, { waitUntil: 'networkidle2' });
-
-  let clickCoordinates;
-  try {
-    clickCoordinates = JSON.parse(options.clicks);
-  } catch (error) {
-    console.error('Invalid JSON for clicks:', error.message);
-    return;
-  }
-
-  // Simulate clicks at each coordinate
-  for (const coord of clickCoordinates) {
-    const x = coord.x * 20
-    const y = coord.y * 20
-    await page.mouse.click(x, y);
-    console.log(`Clicked at (${x}, ${y})`);
-
-    await delay(100);
-  }
-
-  await page.screenshot({ path: screenshotPath });
-
-  await browser.close();
-
-  try {
-    await fs.access(gridSvgPath);
-  } catch (error) {
-    console.error(`Grid SVG file not found: ${gridSvgPath}`);
-    return;
-  }
+const post_process = async (input, output) => {
+  console.log(`access ${gridSvgPath}`)
+  await fs.access(gridSvgPath);
 
   const screenshotBuffer = await fs.readFile(screenshotPath);
   let gridSvgBuffer = await fs.readFile(gridSvgPath);
@@ -70,7 +50,6 @@ const outputPath = 'output.png';
   const left = Math.max(0, (gridSvgMetadata.width - 470) / 2) + 1;
   const top = Math.max(0, (gridSvgMetadata.height - 470) / 2) + 1;
 
-  process.stdout.write(`Creating a base image\n`);
   // Create a base image with the SVG dimensions filled with transparency
   const baseImage = sharp({
     create: {
@@ -83,7 +62,7 @@ const outputPath = 'output.png';
 
   // Composite the PNG onto the base image
   const compositedImage = await baseImage
-    .composite([{ input: screenshotBuffer, top: top, left: left, blend: 'over' }])
+    .composite([{ input: input, top: top, left: left, blend: 'over' }])
     .png()
     .toBuffer();
 
@@ -98,7 +77,40 @@ const outputPath = 'output.png';
     .toBuffer();
 
   // Save the final image
-  await fs.writeFile(outputPath, outputBuffer);
+  console.log(`writeFile ${output}`)
+  await fs.writeFile(output, outputBuffer);
+}
 
-  console.log(`Final image saved as ${outputPath}`);
+(async () => {
+  console.log("launch browser");
+  const browser = await puppeteer.launch();
+  console.log("open blank page");
+  const page = await browser.newPage();
+
+  console.log("set viewport 470x470");
+  await page.setViewport({ width: 470, height: 470 });
+
+  console.log(`goto <${url}>`);
+  await page.goto(url, { waitUntil: 'networkidle2' });
+
+  console.log("process events: ", events);
+  for (const evt of events) {
+    if (evt["type"] == "tap") {
+      const coord = evt["value"]
+      const x = coord.x * 20
+      const y = coord.y * 20
+      await page.mouse.click(x, y);
+      console.log(`Clicked at (${x}, ${y})`);
+      await delay(100);
+    } else if (evt["type"] == "screen") {
+      const dst = evt["value"]
+      await page.screenshot({ path: screenshotPath });
+      console.log('post process screen');
+      await post_process(screenshotPath, dst);
+      console.log(`Screen saved as ${dst}`);
+    }
+  }
+
+  await browser.close();
+
 })();

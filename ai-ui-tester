@@ -109,7 +109,7 @@ class PuppeteerAgent < Agent
     @actions = []
   end
 
-  def add_action_next_version(action = { 'type' => nil })
+  def add_action(action = { 'type' => nil })
     return if action.class != Hash || action['type'].nil?
 
     if @current_action
@@ -128,37 +128,42 @@ class PuppeteerAgent < Agent
     end
   end
 
-  # for old screenshot.cjs only use taps
-  def add_action(action = { 'type' => nil })
-    return if action.class != Hash || action['type'].nil?
-
-    if @current_action
-      if action['type'] == 'taps' && @current_action['type'] == 'taps'
-        @current_action['taps'] += action['pos_ary']
-      end
-    else
-      if action['type'] == 'taps'
-        @current_action = { 'type' => 'taps', 'taps' => action['pos_ary'] }
-      end
-    end
-  end
-
   def execute()
     if @current_action
       @actions << @current_action
       @current_action = nil
     end
 
-    # for old screenshot.cjs
-    taps = @actions.first['taps'].to_json
+    call = ['node', 'screenshot.cjs']
+    @actions.each do |a|
+      k = a['type']
+      if k == 'taps'
+        v = a['taps']
+        v.each do |t|
+          call << '--tap'
+          call << t.to_json
+        end
+      elsif k == 'tap'
+        call << '--tap'
+        call << v.to_json
+      elsif k == 'screen'
+        v = a['opts']
+        if v
+          call << '--screen'
+          call << v['dst'].to_s
+        end
+      end
+    end
     @actions = []
 
     Dir.chdir(@dir) do
-      _i, _o, e, res = Open3.popen3('node', 'screenshot.cjs', '--clicks', taps)
+      _i, o, e, res = Open3.popen3(*call)
       _ = res.value
       errors = e.read.to_s.strip
-      # TODO build logging
-      return false if errors != ''
+      if errors != ''
+        puts errors
+        return false
+      end
     end
 
     true
@@ -173,8 +178,8 @@ class PuppeteerAgent < Agent
   end
 
   # perform a series of clicks/taps
-  def taps(taps = [{'x' => 0, 'y' => 0}], delay = 100)
-    add_action('type' => 'taps', 'pos_ary' => taps, 'opts' => { 'delay' => delay })
+  def taps(pos_ary = [{'x' => 0, 'y' => 0}], delay = 100)
+    add_action('type' => 'taps', 'pos_ary' => pos_ary, 'opts' => { 'delay' => delay })
   end
 end
 
@@ -311,6 +316,7 @@ class TestCtrl
     @events << event if event
 
     @agent.taps(events_to_clicks)
+    @agent.screen
     @agent.execute
 
     move_file_if_exists('test-app/output.png', "test-app/#{test_id}-step-#{@perform_cnt}.png") if test_id

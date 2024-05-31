@@ -4,8 +4,219 @@ require 'fileutils'
 require 'net/http'
 require 'optparse'
 require 'base64'
+require 'open3'
 require 'json'
 require 'yaml'
+
+# Base class for Agents
+class Agent
+  def initialize(id, caps = {})
+    # the provider may not modify our internal caps
+    @caps = caps.to_h.dup
+    @id = id
+  end
+
+  def ensure_ui(options = {})
+    raise "ensure_ui not implemented on Agent::<#{@id}>"
+    # ensure that ui is available for testing
+  end
+
+  def reset_ui()
+    # implement if ui needs special procedures to be reset
+    # needs to be implemented by concrete Agent classes
+  end
+
+  def stop_ui()
+    # implement if ui needs special procedures to be stopped
+    # needs to be implemented by concrete Agent classes
+  end
+
+  def caps
+    # the requester may not modify our internal caps
+    @caps.to_h.dup
+  end
+
+  # create a screenshot (may be zoomed on a sector)
+  def screen(dst = 'output.png', zoom_sector = nil)
+    raise "screen not implemented on Agent::<#{@id}>"
+  end
+
+  # perform click/tap
+  def tap(pos = {'x' => 0, 'y' => 0}, delay = 100)
+    raise "tap not implemented on Agent::<#{@id}>"
+  end
+
+  # perform a series of clicks/taps
+  def taps(taps = [{'x' => 0, 'y' => 0}], delay = 100)
+    raise "taps not implemented on Agent::<#{@id}>"
+  end
+
+  def execute()
+    raise "execute not implemented on Agent::<#{@id}>"
+  end
+end
+
+# Base class for Agents using npm
+class NodeAgent < Agent
+  def initialize(id = 'NodeAgent', caps = {}, dir = '.')
+    super(id, caps)
+    @dir = dir
+  end
+
+  def self.spawn_ui(options = {})
+    return if @pid
+
+    stdin, stdout, stderr, wait_thr = Open3.popen3('npm', 'run', 'dev')
+    Process.detach(wait_thr.pid)
+
+    @node = {
+      :wait_thr => wait_thr,
+      :stdin => stdin,
+      :stdout => stdout,
+      :stderr => stderr,
+    }
+    @pid = wait_thr.pid
+  end
+
+  def self.stop_ui()
+    return unless @pid
+
+    Process.kill('TERM', @pid)
+
+    @node[:stdin].close
+    @node[:stdout].close
+    @node[:stderr].close
+    @pid = nil
+  end
+
+  def stop_ui()
+    NodeAgent.stop_ui()
+  end
+
+  def ensure_ui(options = {})
+    Dir.chdir(@dir) do
+      NodeAgent.spawn_ui(options)
+    end
+  end
+end
+
+# Base class for Agents using Puppeteer
+class PuppeteerAgent < Agent
+  def initialize(id = PuppeteerAgent, caps = {}, dir = '.')
+    super(id, caps)
+    @dir = dir
+    @current_action = nil
+    @actions = []
+  end
+
+  def add_action_next_version(action = { 'type' => nil })
+    return if action.class != Hash || action['type'].nil?
+
+    if @current_action
+      if action['type'] == 'taps' && @current_action['type'] == 'taps'
+        @current_action['taps'] += action['pos_ary']
+      else
+        @actions << @current_action
+        @current_action = { 'type' => action['type'], 'opts' => action['opts'] }
+      end
+    else
+      if action['type'] == 'taps'
+        @current_action = { 'type' => 'taps', 'taps' => action['pos_ary'] }
+      else
+        @current_action = { 'type' => action['type'], 'opts' => action['opts'] }
+      end
+    end
+  end
+
+  # for old screenshot.cjs only use taps
+  def add_action(action = { 'type' => nil })
+    return if action.class != Hash || action['type'].nil?
+
+    if @current_action
+      if action['type'] == 'taps' && @current_action['type'] == 'taps'
+        @current_action['taps'] += action['pos_ary']
+      end
+    else
+      if action['type'] == 'taps'
+        @current_action = { 'type' => 'taps', 'taps' => action['pos_ary'] }
+      end
+    end
+  end
+
+  def execute()
+    if @current_action
+      @actions << @current_action
+      @current_action = nil
+    end
+
+    # for old screenshot.cjs
+    taps = @actions.first['taps'].to_json
+    @actions = []
+
+    Dir.chdir(@dir) do
+      _i, _o, e, res = Open3.popen3('node', 'screenshot.cjs', '--clicks', taps)
+      _ = res.value
+      errors = e.read.to_s.strip
+      # TODO build logging
+      return false if errors != ''
+    end
+
+    true
+  end
+
+  def screen(dst = 'output.png', zoom_sector = nil)
+    add_action('type' => 'screen', 'opts' => { 'dst' => dst, 'zoom_sector' => zoom_sector })
+  end
+
+  def tap(pos = {'x' => 0, 'y' => 0}, delay = 100)
+    add_action('type' => 'taps', 'pos_ary' => [pos], 'opts' => { 'delay' => delay })
+  end
+
+  # perform a series of clicks/taps
+  def taps(taps = [{'x' => 0, 'y' => 0}], delay = 100)
+    add_action('type' => 'taps', 'pos_ary' => taps, 'opts' => { 'delay' => delay })
+  end
+end
+
+class NodePuppeteerAgent < Agent
+  def self.create(options = { 'dir' => '.' })
+    new('NodePuppeteerAgent', caps = {}, options['dir'])
+  end
+
+  def initialize(id = 'NodePuppeteerAgent', caps = {}, dir = '.')
+    @node = NodeAgent.new(id, caps, dir)
+    @puppet = PuppeteerAgent.new(id, caps, dir)
+    super(id, caps)
+  end
+
+  def ensure_ui()
+    @node.ensure_ui
+  end
+
+  def reset_ui()
+    @node.reset_ui
+  end
+
+  def stop_ui()
+    @node.stop_ui
+  end
+
+  def screen(dst = 'output.png', zoom_sector = nil)
+    @puppet.screen(dst, zoom_sector)
+  end
+
+  def tap(pos = {'x' => 0, 'y' => 0}, delay = 100)
+    @puppet.tap(pos, delay)
+  end
+
+  def taps(pos_ary = [{'x' => 0, 'y' => 0}], delay = 100)
+    @puppet.taps(pos_ary, delay)
+  end
+
+  def execute()
+    @puppet.execute
+  end
+end
 
 $options = {}
 OptionParser.new do |opts|
@@ -42,6 +253,7 @@ class TestCtrl
     @tests = tests
     @events = []
     @perform_cnt = 0
+    @agent = NodePuppeteerAgent.create('dir' => 'test-app')
   end
 
   def build_eval_prompt(eval_str)
@@ -96,12 +308,13 @@ class TestCtrl
   end
 
   def perform(event = nil, test_id = nil)
-    Dir.chdir('test-app') do
-      @events << event if event
-      `node screenshot.cjs --clicks '#{events_to_clicks.to_json}'`
-      move_file_if_exists('output.png', "#{test_id}-step-#{@perform_cnt}.png") if test_id
-      @perform_cnt += 1
-    end
+    @events << event if event
+
+    @agent.taps(events_to_clicks)
+    @agent.execute
+
+    move_file_if_exists('test-app/output.png', "test-app/#{test_id}-step-#{@perform_cnt}.png") if test_id
+    @perform_cnt += 1
   end
 
   def evaluate()

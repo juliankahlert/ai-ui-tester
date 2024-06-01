@@ -1,12 +1,473 @@
 #!/bin/env ruby
 
-require 'fileutils'
-require 'net/http'
-require 'optparse'
-require 'base64'
-require 'open3'
-require 'json'
-require 'yaml'
+require "fileutils"
+require "net/http"
+require "optparse"
+require "base64"
+require "open3"
+require "json"
+require "yaml"
+
+class ToolFunctions
+  CALLBACK_API_FUNCTIONS = {
+    "tap" => {
+      "prototype" => {
+        "description" => "Click/Tap onto a section of the Zoomed UI",
+        "parameters" => {
+          "type" => "object",
+          "properties" => {
+            "x" => {
+              "type" => "integer",
+              "description" => "The X axis location of the subsector in zoom",
+            },
+            "y" => {
+              "type" => "integer",
+              "description" => "The Y axis location of the subsector in zoom",
+            },
+          },
+          "required" => [
+            "x",
+            "y",
+          ],
+        },
+      },
+      "impl" => proc { |ctx, args|
+        puts args["x"]
+        puts args["y"]
+      },
+    },
+    "zoom" => {
+      "prototype" => {
+        "description" => "Zoom onto a section of the UI",
+        "parameters" => {
+          "type" => "object",
+          "properties" => {
+            "x" => {
+              "type" => "integer",
+              "description" => "The X axis location to zoom onto",
+            },
+            "y" => {
+              "type" => "integer",
+              "description" => "The Y axis location to zoom onto",
+            },
+          },
+          "required" => [
+            "x",
+            "y",
+          ],
+        },
+      },
+      "impl" => proc { |ctx, args|
+        puts args["x"]
+        puts args["y"]
+      },
+    },
+  }
+
+  def initialize()
+    # nop
+  end
+
+  def api
+    CALLBACK_API_FUNCTIONS
+  end
+
+  def try_call(fn_call)
+    return false unless fn_call
+
+    args_str = fn_call["arguments"]
+    args = if args_str
+        JSON.parse(args_str.to_s).to_h
+      else
+        {}
+      end
+
+    impl = api()[fn_call["name"]]["impl"]
+    return impl.call(self, args)
+  end
+
+  def json(kind = :default)
+    return self.array.to_json unless kind == :pretty
+
+    JSON.pretty_generate(self.array)
+  end
+
+  def array
+    return @ary if @ary
+
+    @ary = []
+    api().each do |k, v|
+      proto = { "name" => k }
+      proto = proto.merge(v["prototype"])
+      @ary << proto
+    end
+
+    @ary
+  end
+end
+
+class OpenAI
+  class Message
+    def initialize(openai, role = "user")
+      @role = role
+      @openai = openai
+    end
+
+    def dup
+      clone = Message.new(@openai, @role.dup)
+      clone.text(@text.dup)
+      clone.image_data(@image.dup)
+      clone
+    end
+
+    def text(data)
+      @text = data
+      self
+    end
+
+    def image(path)
+      return self unless path
+
+      data = @openai.encode_file_as_base64(path)
+      @image = "data:image/png;base64,#{data}"
+      self
+    end
+
+    def image_data(data)
+      @image = data
+      self
+    end
+
+    def to_h
+      message = { "role" => @role }
+
+      if @image
+        message["content"] = []
+        message["content"] << {
+          "type" => "image_url",
+          "image_url" => {
+            "url" => @image,
+          },
+        }
+
+        if @text
+          message["content"] << {
+            "type" => "text",
+            "text" => @text,
+          }
+        end
+      elsif @text
+        message["content"] = @text
+      end
+
+      message
+    end
+  end
+
+  class Session
+    def initialize(openai, history = [])
+      @history = history
+      @openai = openai
+    end
+
+    def dup
+      OpenAI::Session.new(@openai, @history.dup)
+    end
+
+    def dump
+      @history.dup
+    end
+
+    def new_message(role = "user", &block)
+      m = OpenAI::Message.new(@openai, role)
+      block.call(m) if block
+      m
+    end
+
+    def self.load(path)
+      return self.new unless path
+
+      history = []
+      File.read(path).split("\n").map do |line|
+        history << JSON.parse(line)
+      end
+
+      self.new(history)
+    end
+
+    def append(message = nil, &block)
+      message ||= block.call(self)
+      @history << message.to_h
+    end
+  end
+
+  class ResponseBuilder
+    class Response
+      attr_reader :request, :completion, :error, :function_call
+
+      def initialize(request, success, error, completion, function_call)
+        @request = request
+        @success = success
+        @error = error
+        @completion = completion
+        @function_call = function_call
+      end
+
+      def success?
+        @success == true
+      end
+    end
+
+    def initialize(request)
+      @request = request
+      @valid = true
+    end
+
+    def success(value = true)
+      @success = value
+      self
+    end
+
+    def error(value)
+      @error = value
+      self
+    end
+
+    def function_call(call)
+      @function_call = call
+      self
+    end
+
+    def completion(data)
+      @completion = data
+      self
+    end
+
+    def self.success(request)
+      builder = ResponseBuilder.new(request)
+      builder.success(true)
+    end
+
+    def self.fail(request, error)
+      builder = ResponseBuilder.new(request)
+      builder.success(false).error(error)
+    end
+
+    def seal
+      return nil unless @valid
+
+      r = Response.new(@request,
+                       @success,
+                       @error,
+                       @completion,
+                       @function_call)
+
+      @valid = false
+      r
+    end
+  end
+
+  class Request
+    def initialize(openai)
+      @openai = openai
+    end
+
+    def attach_tools(tools)
+      @tools = tools
+      self
+    end
+
+    def attach_session(session = nil)
+      session = OpenAI::Session.new unless session
+      @session = session
+      self
+    end
+
+    def session
+      @session ||= attach_session
+      @session
+    end
+
+    def fail(error)
+      OpenAI::ResponseBuilder.fail(self, error)
+    end
+
+    def success
+      OpenAI::ResponseBuilder.success(self)
+    end
+
+    def prepare
+      request = Net::HTTP::Post.new(@openai.uri)
+      request.content_type = "application/json"
+      request["Authorization"] = "Bearer #{@openai.token}"
+
+      body = {
+        "model" => @openai.model,
+        "max_tokens" => @openai.max_tokens,
+        "n" => @openai.n,
+        "top_p" => 0.1,
+        "temperature" => 0.2,
+        "messages" => @session.dump,
+      }
+      body["functions"] = @tools.array if @tools
+
+      request.body = body.to_json
+      @request = request
+      self
+    end
+
+    def run
+      return fail("ERROR: request not prepared").seal unless @request
+
+      host = @openai.uri.hostname
+      port = @openai.uri.port
+
+      response = Net::HTTP.start(host, port, use_ssl: true) do |http|
+        http.read_timeout = 600
+        http.request(@request)
+      end
+      @request = nil
+
+      if response.is_a?(Net::HTTPSuccess)
+        parsed_response = JSON.parse(response.body)
+        function_call = parsed_response["choices"][0]["message"]["function_call"]
+        @tools.try_call(function_call) if @tools
+
+        completion = parsed_response["choices"][0]["message"]["content"]
+        if completion
+          completion = completion.to_s + "\n"
+          completion = completion.gsub(/^```.*\n/, "")
+        end
+      else
+        return fail("Error: #{response.message}").seal
+      end
+
+      return success().function_call(function_call)
+                      .completion(completion)
+                      .seal
+    rescue StandardError => e
+      return fail(e.to_s).seal
+    end
+  end
+
+  attr_reader :token, :uri
+
+  def initialize(config)
+    @cfg = config[:config_file]
+    @cfg ||= find_cfg
+    @token = config[:token]
+    @model = config[:model_string]
+    @model ||= model
+    @uri = URI("https://api.openai.com/v1/chat/completions")
+
+    sanity_check
+  end
+
+  def new_request(&block)
+    r = Request.new(self)
+    return block.call(r).prepare.run if block
+    r
+  end
+
+  def new_session(&block)
+    s = Session.new(self)
+    block.call(s) if block
+    s
+  end
+
+  def new_message(role = "user", &block)
+    m = Message.new(self, role)
+    block.call(m) if block
+    m
+  end
+
+  def model
+    return @model if @model
+
+    return nil unless @cfg
+    return nil unless @cfg["openai"]
+    return nil unless @cfg["openai"]["model"]
+
+    @model = @cfg["openai"]["model"]
+    @model
+  end
+
+  def max_tokens
+    return @max_tokens if @max_tokens
+
+    default = 150
+    return default unless @cfg
+    return default unless @cfg["openai"]
+    return default unless @cfg["openai"]["params"]
+    return default unless @cfg["openai"]["params"]["max-tokens"]
+
+    @max_tokens = @cfg["openai"]["params"]["max-tokens"]
+    @max_tokens
+  end
+
+  def n
+    return @n if @n
+
+    default = 1
+    return default unless @cfg
+    return default unless @cfg["openai"]
+    return default unless @cfg["openai"]["params"]
+    return default unless @cfg["openai"]["params"]["n"]
+
+    @n = @cfg["openai"]["params"]["n"]
+    @n
+  end
+
+  def temperature
+    return @temperature if @temperature
+
+    default = 0.7
+    return default unless @cfg
+    return default unless @cfg["openai"]
+    return default unless @cfg["openai"]["params"]
+    return default unless @cfg["openai"]["params"]["temperature"]
+
+    @temperature = @cfg["openai"]["params"]["temperature"]
+    @temperature
+  end
+
+  def die(msg)
+    STDERR.puts(msg.to_s)
+    exit(1)
+  end
+
+  def sanity_check
+    die("Error: .openai.yaml not found") unless @cfg
+    die("Error: Token not found") unless @token
+    die("Error: Model missing") unless @model
+  end
+
+  def find_cfg
+    pwd = Dir.pwd
+    dirs = pwd.split("/")
+    cfg = nil
+    (dirs.size + 1).times do |i|
+      path = dirs[0, dirs.size - i].join("/") + "/.openai.yaml"
+      if File.exist?(path)
+        cfg = YAML.load_file(path)
+        break
+      end
+    end
+    cfg
+  end
+
+  def encode_file_as_base64(file_path)
+    unless File.exist?(file_path.to_s)
+      puts "File not found: <#{file_path}>"
+      return nil
+    end
+
+    file_content = File.binread(file_path)
+    encoded_content = Base64.strict_encode64(file_content)
+
+    return encoded_content
+  end
+end
 
 # Base class for Agents
 class Agent
@@ -37,17 +498,17 @@ class Agent
   end
 
   # create a screenshot (may be zoomed on a sector)
-  def screen(dst = 'output.png', zoom_sector = nil)
+  def screen(dst = "output.png", zoom_sector = nil)
     raise "screen not implemented on Agent::<#{@id}>"
   end
 
   # perform click/tap
-  def tap(pos = {'x' => 0, 'y' => 0}, delay = 100)
+  def tap(pos = { "x" => 0, "y" => 0 }, delay = 100)
     raise "tap not implemented on Agent::<#{@id}>"
   end
 
   # perform a series of clicks/taps
-  def taps(taps = [{'x' => 0, 'y' => 0}], delay = 100)
+  def taps(taps = [{ "x" => 0, "y" => 0 }], delay = 100)
     raise "taps not implemented on Agent::<#{@id}>"
   end
 
@@ -58,7 +519,7 @@ end
 
 # Base class for Agents using npm
 class NodeAgent < Agent
-  def initialize(id = 'NodeAgent', caps = {}, dir = '.')
+  def initialize(id = "NodeAgent", caps = {}, dir = ".")
     super(id, caps)
     @dir = dir
   end
@@ -66,7 +527,7 @@ class NodeAgent < Agent
   def self.spawn_ui(options = {})
     return if @pid
 
-    stdin, stdout, stderr, wait_thr = Open3.popen3('npm', 'run', 'dev')
+    stdin, stdout, stderr, wait_thr = Open3.popen3("npm", "run", "dev")
     Process.detach(wait_thr.pid)
 
     @node = {
@@ -81,7 +542,7 @@ class NodeAgent < Agent
   def self.stop_ui()
     return unless @pid
 
-    Process.kill('TERM', @pid)
+    Process.kill("TERM", @pid)
 
     @node[:stdin].close
     @node[:stdout].close
@@ -102,28 +563,28 @@ end
 
 # Base class for Agents using Puppeteer
 class PuppeteerAgent < Agent
-  def initialize(id = PuppeteerAgent, caps = {}, dir = '.')
+  def initialize(id = PuppeteerAgent, caps = {}, dir = ".")
     super(id, caps)
     @dir = dir
     @current_action = nil
     @actions = []
   end
 
-  def add_action(action = { 'type' => nil })
-    return if action.class != Hash || action['type'].nil?
+  def add_action(action = { "type" => nil })
+    return if action.class != Hash || action["type"].nil?
 
     if @current_action
-      if action['type'] == 'taps' && @current_action['type'] == 'taps'
-        @current_action['taps'] += action['pos_ary']
+      if action["type"] == "taps" && @current_action["type"] == "taps"
+        @current_action["taps"] += action["pos_ary"]
       else
         @actions << @current_action
-        @current_action = { 'type' => action['type'], 'opts' => action['opts'] }
+        @current_action = { "type" => action["type"], "opts" => action["opts"] }
       end
     else
-      if action['type'] == 'taps'
-        @current_action = { 'type' => 'taps', 'taps' => action['pos_ary'] }
+      if action["type"] == "taps"
+        @current_action = { "type" => "taps", "taps" => action["pos_ary"] }
       else
-        @current_action = { 'type' => action['type'], 'opts' => action['opts'] }
+        @current_action = { "type" => action["type"], "opts" => action["opts"] }
       end
     end
   end
@@ -134,23 +595,23 @@ class PuppeteerAgent < Agent
       @current_action = nil
     end
 
-    call = ['node', 'screenshot.cjs']
+    call = ["node", "screenshot.cjs"]
     @actions.each do |a|
-      k = a['type']
-      if k == 'taps'
-        v = a['taps']
+      k = a["type"]
+      if k == "taps"
+        v = a["taps"]
         v.each do |t|
-          call << '--tap'
+          call << "--tap"
           call << t.to_json
         end
-      elsif k == 'tap'
-        call << '--tap'
+      elsif k == "tap"
+        call << "--tap"
         call << v.to_json
-      elsif k == 'screen'
-        v = a['opts']
+      elsif k == "screen"
+        v = a["opts"]
         if v
-          call << '--screen'
-          call << v['dst'].to_s
+          call << "--screen"
+          call << v["dst"].to_s
         end
       end
     end
@@ -160,7 +621,7 @@ class PuppeteerAgent < Agent
       _i, o, e, res = Open3.popen3(*call)
       _ = res.value
       errors = e.read.to_s.strip
-      if errors != ''
+      if errors != ""
         puts errors
         return false
       end
@@ -169,26 +630,26 @@ class PuppeteerAgent < Agent
     true
   end
 
-  def screen(dst = 'output.png', zoom_sector = nil)
-    add_action('type' => 'screen', 'opts' => { 'dst' => dst, 'zoom_sector' => zoom_sector })
+  def screen(dst = "output.png", zoom_sector = nil)
+    add_action("type" => "screen", "opts" => { "dst" => dst, "zoom_sector" => zoom_sector })
   end
 
-  def tap(pos = {'x' => 0, 'y' => 0}, delay = 100)
-    add_action('type' => 'taps', 'pos_ary' => [pos], 'opts' => { 'delay' => delay })
+  def tap(pos = { "x" => 0, "y" => 0 }, delay = 100)
+    add_action("type" => "taps", "pos_ary" => [pos], "opts" => { "delay" => delay })
   end
 
   # perform a series of clicks/taps
-  def taps(pos_ary = [{'x' => 0, 'y' => 0}], delay = 100)
-    add_action('type' => 'taps', 'pos_ary' => pos_ary, 'opts' => { 'delay' => delay })
+  def taps(pos_ary = [{ "x" => 0, "y" => 0 }], delay = 100)
+    add_action("type" => "taps", "pos_ary" => pos_ary, "opts" => { "delay" => delay })
   end
 end
 
 class NodePuppeteerAgent < Agent
-  def self.create(options = { 'dir' => '.' })
-    new('NodePuppeteerAgent', caps = {}, options['dir'])
+  def self.create(options = { "dir" => "." })
+    new("NodePuppeteerAgent", caps = {}, options["dir"])
   end
 
-  def initialize(id = 'NodePuppeteerAgent', caps = {}, dir = '.')
+  def initialize(id = "NodePuppeteerAgent", caps = {}, dir = ".")
     @node = NodeAgent.new(id, caps, dir)
     @puppet = PuppeteerAgent.new(id, caps, dir)
     super(id, caps)
@@ -206,15 +667,15 @@ class NodePuppeteerAgent < Agent
     @node.stop_ui
   end
 
-  def screen(dst = 'output.png', zoom_sector = nil)
+  def screen(dst = "output.png", zoom_sector = nil)
     @puppet.screen(dst, zoom_sector)
   end
 
-  def tap(pos = {'x' => 0, 'y' => 0}, delay = 100)
+  def tap(pos = { "x" => 0, "y" => 0 }, delay = 100)
     @puppet.tap(pos, delay)
   end
 
-  def taps(pos_ary = [{'x' => 0, 'y' => 0}], delay = 100)
+  def taps(pos_ary = [{ "x" => 0, "y" => 0 }], delay = 100)
     @puppet.taps(pos_ary, delay)
   end
 
@@ -223,42 +684,60 @@ class NodePuppeteerAgent < Agent
   end
 end
 
-$options = {}
-OptionParser.new do |opts|
-  opts.banner = "Usage: openai_requester.rb [options]"
+class TestCtrl
+  EXAMPLE = {
+    "event" => {
+      "type" => "click",
+      "sector" => {
+        "x" => 12,
+        "y" => 13,
+      },
+    },
+  }.to_json
 
-  opts.on("--config [CONFIGFILE]", "Test config file") do |test_config|
-    if File.exists?(test_config)
-      $options[:test_config] = test_config
-      $options[:test_state] = ".state.#{test_config}"
+  EXAMPLE2 = {
+    "result" => "pass or fail",
+    "reason" => "A sensible reason why pass or fail",
+  }.to_json
+
+  SYSTEM_PROMT = "You are a UI tester. The UI divided into sectors from 0 to 24 on X and Y axis.Answer in json like this event json:\n```json\n#{EXAMPLE}\n```\nor result json:\n```json\n#{EXAMPLE2}\n"
+
+  class RequestFactory
+    def initialize(openai)
+      @openai = openai
+      @ref_session = @openai.new_session()
+    end
+
+    def append(&block)
+      @ref_session.append do |sess|
+        block.call(sess)
+      end
+    end
+
+    def create
+      sess = @ref_session.dup
+      req = @openai.new_request.attach_session(sess)
+      req
     end
   end
 
-  opts.on("--token [TOKEN]", "OpenAI token") do |token|
-    $options[:token] = token
-  end
-end.parse!
-
-if $options[:test_config].nil?
-  STDERR.puts "Error: Missing config"
-  exit 1
-end
-
-cfg = YAML.load_file($options[:test_config])
-tests = cfg['tests'].to_a
-
-class TestCtrl
-
   PROMT_FRAGMENTS = {
-    'SELECT' => "select the lower right of",
-    'CLICK' => "click the lower right of",
+    "SELECT" => "select the lower right of",
+    "CLICK" => "click the lower right of",
   }
 
-  def initialize(tests)
+  def initialize(openai, tests)
+    @openai = openai
     @tests = tests
     @events = []
     @perform_cnt = 0
-    @agent = NodePuppeteerAgent.create('dir' => 'test-app')
+    @agent = NodePuppeteerAgent.create("dir" => "test-app")
+
+    @req_factory = RequestFactory.new(@openai)
+    @req_factory.append do |sess|
+      sess.new_message("system")
+        .text(SYSTEM_PROMT)
+    end
   end
 
   def build_eval_prompt(eval_str)
@@ -285,23 +764,22 @@ class TestCtrl
     clicks = []
     # ai generated json strings => caution
     @events.each do |e|
-      event = e['event']
+      event = e["event"]
       next unless event
-      next unless event.class == Hash && event['type'] == 'click'
+      next unless event.class == Hash && event["type"] == "click"
 
-      sector = event['sector']
+      sector = event["sector"]
       next unless sector && sector.class == Hash
-      x = sector['x']
-      x ||= sector['X']     
-      y = sector['y']
-      y ||= sector['Y']
+      x = sector["x"]
+      x ||= sector["X"]
+      y = sector["y"]
+      y ||= sector["Y"]
       next unless x && y
 
-      clicks << { 'x' => x, 'y' => y }
+      clicks << { "x" => x, "y" => y }
     end
     clicks
   end
-
 
   def move_file_if_exists(source, destination)
     if File.exist?(source)
@@ -319,27 +797,37 @@ class TestCtrl
     @agent.screen
     @agent.execute
 
-    move_file_if_exists('test-app/output.png', "test-app/#{test_id}-step-#{@perform_cnt}.png") if test_id
+    move_file_if_exists("test-app/output.png", "test-app/#{test_id}-step-#{@perform_cnt}.png") if test_id
     @perform_cnt += 1
   end
 
   def evaluate()
-   #nop
+    #nop
   end
 
   def prepare_test(test)
-    test['report'] = {
-      'actions' => [],
-      'result' => {},
+    test["report"] = {
+      "actions" => [],
+      "result" => {},
     }
 
-    Dir.chdir('test-app') do
+    Dir.chdir("test-app") do
       FileUtils.rm_f("output.png")
     end
 
     @perform_cnt = 0
     @events = []
-    perform(nil, test['uid'])
+    perform(nil, test["uid"])
+  end
+
+  def request(prompt, image_path)
+    req = @req_factory.create
+    req.session.append do |sess|
+      sess.new_message()
+          .image(image_path)
+          .text(prompt)
+    end
+    req.prepare.run.completion.to_s
   end
 
   def run
@@ -347,44 +835,71 @@ class TestCtrl
       3.times do
         prepare_test(test)
 
-        steps = test['steps'].to_a
+        steps = test["steps"].to_a
         steps.each do |step|
           event = nil
           result = nil
           3.times do
-            action = build_action_prompt(step['perform'])
+            action = build_action_prompt(step["perform"])
             5.times do
-              event_str = `ruby ./openai-request --token #{$options[:token]} --prompt '#{action}' --png test-app/output.png`
-              prompt = build_check_prompt(event_str, step['perform'])
-              result_str = `ruby ./openai-request --token #{$options[:token]} --prompt '#{prompt}' --png test-app/output.png`
+              event_str = request(action, "test-app/output.png")
+              prompt = build_check_prompt(event_str, step["perform"])
+              result_str = request(prompt, "test-app/output.png")
               result = JSON.parse(result_str)
               event = JSON.parse(event_str)
-              break if result['result'] == 'pass'
+              break if result["result"] == "pass"
             end
-            perform(event, test['uid']) if result['result'] == 'pass'
+            perform(event, test["uid"]) if result["result"] == "pass"
 
-            prompt = build_eval_prompt(step['eval'].to_s)
-            result_str = `ruby ./openai-request --token #{$options[:token]} --prompt '#{prompt}' --png test-app/output.png`
+            prompt = build_eval_prompt(step["eval"].to_s)
+            result_str = request(prompt, "test-app/output.png")
             result = JSON.parse(result_str)
-            break if result['result'] == 'pass'
+            break if result["result"] == "pass"
 
             # perform failed
             @perform_cnt -= 1
           end
-          test['report']['actions'] << event
+          test["report"]["actions"] << event
         end
-        prompt = build_eval_prompt(test['eval'].to_s)
-        result_str = `ruby ./openai-request --token #{$options[:token]} --prompt '#{prompt}' --png test-app/output.png`
+        prompt = build_eval_prompt(test["eval"].to_s)
+        result_str = request(prompt, "test-app/output.png")
         result = JSON.parse(result_str)
-        test['report']['result'] = result
+        test["report"]["result"] = result
         puts result_str
-        break if result['result'] == 'pass'
+        break if result["result"] == "pass"
       end
     end
   end
 end
 
-ctrl = TestCtrl.new(tests)
+options = {}
+OptionParser.new do |opts|
+  opts.banner = "Usage: openai_requester.rb [options]"
+
+  opts.on("--config [CONFIGFILE]", "Test config file") do |test_config|
+    if File.exists?(test_config)
+      options[:test_config] = test_config
+      options[:test_state] = ".state.#{test_config}"
+    end
+  end
+
+  opts.on("--token [TOKEN]", "OpenAI token") do |token|
+    options[:token] = token
+  end
+end.parse!
+
+if options[:test_config].nil?
+  STDERR.puts "Error: Missing config"
+  exit 1
+end
+
+cfg = YAML.load_file(options[:test_config])
+tests = cfg["tests"].to_a
+
+
+openai = OpenAI.new(options)
+
+ctrl = TestCtrl.new(openai, tests)
 ctrl.run
 
-File.open('report.yaml', 'w') {|f| f.write tests.to_yaml }
+File.open("report.yaml", "w") { |f| f.write tests.to_yaml }

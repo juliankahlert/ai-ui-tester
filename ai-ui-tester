@@ -8,7 +8,86 @@ require "open3"
 require "json"
 require "yaml"
 
-class ToolFunctions
+class FlowToolFunctions
+  CALLBACK_API_FUNCTIONS = {
+    "flow_ctrl" => {
+      "prototype" => {
+        "description" => "Control the test flow. Continue or abort the test.",
+        "parameters" => {
+          "type" => "object",
+          "properties" => {
+            "reason" => {
+              "type" => "string",
+              "description" => "a detailed reason",
+            },
+            "success" => {
+              "type" => "boolean",
+              "description" => "true if task was successfull, false if not",
+            },
+            "stop" => {
+              "type" => "boolean",
+              "description" => "true if the test shall be stopped",
+            },
+          },
+          "required" => [
+            "reason",
+            "success",
+            "stop",
+          ],
+        },
+      },
+      "impl" => proc { |tools, args|
+        tools.context.flow_ctrl(args)
+      },
+    }
+  }
+
+
+  attr_reader :context
+
+  def initialize(ctx = nil)
+    @context = ctx
+  end
+
+  def api
+    CALLBACK_API_FUNCTIONS
+  end
+
+  def try_call(fn_call)
+    return false unless fn_call
+
+    args_str = fn_call["arguments"]
+    args = if args_str
+        JSON.parse(args_str.to_s).to_h
+      else
+        {}
+      end
+
+    impl = api()[fn_call["name"]]["impl"]
+    return impl.call(self, args)
+  end
+
+  def json(kind = :default)
+    return self.array.to_json unless kind == :pretty
+
+    JSON.pretty_generate(self.array)
+  end
+
+  def array
+    return @ary if @ary
+
+    @ary = []
+    api().each do |k, v|
+      proto = { "name" => k }
+      proto = proto.merge(v["prototype"])
+      @ary << proto
+    end
+
+    @ary
+  end
+end
+
+class AgentToolFunctions
   CALLBACK_API_FUNCTIONS = {
     "tap" => {
       "prototype" => {
@@ -24,48 +103,65 @@ class ToolFunctions
               "type" => "integer",
               "description" => "The Y axis location of the subsector in zoom",
             },
-          },
-          "required" => [
-            "x",
-            "y",
-          ],
-        },
-      },
-      "impl" => proc { |ctx, args|
-        puts args["x"]
-        puts args["y"]
-      },
-    },
-    "zoom" => {
-      "prototype" => {
-        "description" => "Zoom onto a section of the UI",
-        "parameters" => {
-          "type" => "object",
-          "properties" => {
-            "x" => {
-              "type" => "integer",
-              "description" => "The X axis location to zoom onto",
-            },
-            "y" => {
-              "type" => "integer",
-              "description" => "The Y axis location to zoom onto",
+            "reason" => {
+              "type" => "string",
+              "description" => "The reason why the tap was performed",
             },
           },
           "required" => [
             "x",
             "y",
+            "reason",
           ],
         },
       },
-      "impl" => proc { |ctx, args|
-        puts args["x"]
-        puts args["y"]
+      "impl" => proc { |tools, args|
+        event = {
+          "event" => {
+            "type" => "click",
+            "reason" => args["reason"].to_s,
+            "sector" => {
+              "x" => args["x"].to_i,
+              "y" => args["y"].to_i,
+            },
+          },
+        }
+        tools.context.perform(event)
       },
     },
+#    "zoom" => {
+#      "prototype" => {
+#        "description" => "Zoom onto a section of the UI",
+#        "parameters" => {
+#          "type" => "object",
+#          "properties" => {
+#            "x" => {
+#              "type" => "integer",
+#              "description" => "The X axis location to zoom onto",
+#            },
+#            "y" => {
+#              "type" => "integer",
+#              "description" => "The Y axis location to zoom onto",
+#            },
+#          },
+#          "required" => [
+#            "x",
+#            "y",
+#          ],
+#        },
+#      },
+#      "impl" => proc { |ctx, args|
+#        puts args["x"]
+#        puts args["y"]
+#      },
+#    },
   }
 
-  def initialize()
-    # nop
+
+  attr_reader :context
+
+  def initialize(ctx = nil)
+    @context = ctx
   end
 
   def api
@@ -199,6 +295,10 @@ class OpenAI
       message ||= block.call(self)
       @history << message.to_h
     end
+
+    def pop()
+      @history.pop()
+    end
   end
 
   class ResponseBuilder
@@ -277,6 +377,11 @@ class OpenAI
       self
     end
 
+    def attach_tool_choice(choice)
+      @tool_choice = choice
+      self
+    end
+
     def attach_session(session = nil)
       session = OpenAI::Session.new unless session
       @session = session
@@ -307,9 +412,11 @@ class OpenAI
         "n" => @openai.n,
         "top_p" => 0.1,
         "temperature" => 0.2,
+ #       "frequency_penalty" => 2.0,
         "messages" => @session.dump,
       }
       body["functions"] = @tools.array if @tools
+      body["function_call"] = @tool_choice if @tool_choice
 
       request.body = body.to_json
       @request = request
@@ -700,7 +807,8 @@ class TestCtrl
     "reason" => "A sensible reason why pass or fail",
   }.to_json
 
-  SYSTEM_PROMT = "You are a UI tester. The UI divided into sectors from 0 to 24 on X and Y axis.Answer in json like this event json:\n```json\n#{EXAMPLE}\n```\nor result json:\n```json\n#{EXAMPLE2}\n"
+  #SYSTEM_PROMT = "You are a UI tester. The UI divided into sectors from 0 to 24 on X and Y axis.Answer in json like this event json:\n```json\n#{EXAMPLE}\n```\nor result json:\n```json\n#{EXAMPLE2}\n"
+  SYSTEM_PROMT = "You are a UI tester. The UI divided into sectors from 0 to 24 on X and Y axis.\n"
 
   class RequestFactory
     def initialize(openai)
@@ -730,8 +838,11 @@ class TestCtrl
     @openai = openai
     @tests = tests
     @events = []
+    @flow = []
     @perform_cnt = 0
     @agent = NodePuppeteerAgent.create("dir" => "test-app")
+    @agent_tools = AgentToolFunctions.new(self)
+    @flow_tools = FlowToolFunctions.new(self)
 
     @req_factory = RequestFactory.new(@openai)
     @req_factory.append do |sess|
@@ -756,7 +867,7 @@ class TestCtrl
     PROMT_FRAGMENTS.each do |k, v|
       step = step.gsub(k, v)
     end
-    step + ". Respond with event json!"
+    step # + ". Respond with event json!"
   end
 
   # TODO More complex event parsing in screenshot.cjs
@@ -790,15 +901,21 @@ class TestCtrl
     end
   end
 
-  def perform(event = nil, test_id = nil)
+  def flow_ctrl(flow)
+    @flow << { 'ctrl' => flow } if flow
+  end
+
+  def perform(event = nil)
     @events << event if event
+    @perform_cnt += 1
+
+    puts event.to_json
 
     @agent.taps(events_to_clicks)
     @agent.screen
     @agent.execute
 
-    move_file_if_exists("test-app/output.png", "test-app/#{test_id}-step-#{@perform_cnt}.png") if test_id
-    @perform_cnt += 1
+    move_file_if_exists("test-app/output.png", "test-app/#{@test_id}-step-#{@perform_cnt}.png") if @test_id
   end
 
   def evaluate()
@@ -811,63 +928,131 @@ class TestCtrl
       "result" => {},
     }
 
+    @test_id = test['uid']
+
     Dir.chdir("test-app") do
       FileUtils.rm_f("output.png")
     end
 
     @perform_cnt = 0
     @events = []
-    perform(nil, test["uid"])
+    @flow = []
+    @test_id = test["uid"]
+    perform(nil)
   end
 
-  def request(prompt, image_path)
-    req = @req_factory.create
-    req.session.append do |sess|
+  def run_eval(test)
+    return true unless test['eval']
+    
+    sess = @openai.new_session()
+
+    sess.append do |sess|
       sess.new_message()
-          .image(image_path)
-          .text(prompt)
+          .image("test-app/output.png")
     end
-    req.prepare.run.completion.to_s
+
+    prompt = {
+      "task" => "Is the pass-condition fullfilled?",
+      "pass-condition" => test['eval'],
+    }
+
+    sess.append do |sess|
+      sess.new_message()
+          .text(prompt.to_json)
+    end
+
+    req = @openai.new_request()
+    req.attach_tools(@flow_tools)
+    req.attach_tool_choice({"name" => "flow_ctrl"})
+    req.attach_session(sess)
+    @flow = []
+    res = req.prepare.run
+    return @flow.last['ctrl']['success'] if @flow.last
+
+    false
+  end
+
+  def run_step(step)
+    sess = @openai.new_session()
+
+    sess.append do |sess|
+      sess.new_message()
+          .image("test-app/output.png")
+    end
+
+    5.times do
+      prompt = {
+        "task" => step['task'],
+        "pass-condition" => step['eval'],
+        "hint" => "variy your actions",
+        "response" => {
+          "fail" => "flow_ctrl",
+          "pass" => "flow_ctrl",
+        },
+      }
+
+      sess.append do |sess|
+        sess.new_message()
+            .text(prompt.to_json)
+      end
+
+      req = @openai.new_request()
+      req.attach_session(sess)
+      req.attach_tools(@agent_tools)
+      res = req.prepare.run
+
+      sess.append do |sess|
+        sess.new_message('assistant')
+            .text(@events.last.to_json)
+      end
+
+      prompt = {
+        "task" => "finish or continue",
+        "response" => {
+          "fail" => "finish or continue",
+          "pass" => "finish",
+        },
+      }
+
+      sess.append do |sess|
+        sess.new_message()
+            .image("test-app/output.png")
+      end
+
+      sess.append do |sess|
+        sess.new_message()
+            .text(prompt.to_json)
+      end
+
+      req = @openai.new_request()
+      req.attach_tools(@flow_tools)
+      req.attach_tool_choice({"name" => "flow_ctrl"})
+      req.attach_session(sess)
+      res = req.prepare.run
+
+      if @flow.last
+        sess.append do |sess|
+          sess.new_message('assistant')
+              .text(@flow.last['ctrl'].to_json)
+        end
+
+        if @flow.last['ctrl']['stop']
+          return @flow.last['ctrl']['success']
+        end
+      end
+    end
+    false
   end
 
   def run
-    @tests.each do |test|
-      3.times do
-        prepare_test(test)
-
-        steps = test["steps"].to_a
-        steps.each do |step|
-          event = nil
-          result = nil
-          3.times do
-            action = build_action_prompt(step["perform"])
-            5.times do
-              event_str = request(action, "test-app/output.png")
-              prompt = build_check_prompt(event_str, step["perform"])
-              result_str = request(prompt, "test-app/output.png")
-              result = JSON.parse(result_str)
-              event = JSON.parse(event_str)
-              break if result["result"] == "pass"
-            end
-            perform(event, test["uid"]) if result["result"] == "pass"
-
-            prompt = build_eval_prompt(step["eval"].to_s)
-            result_str = request(prompt, "test-app/output.png")
-            result = JSON.parse(result_str)
-            break if result["result"] == "pass"
-
-            # perform failed
-            @perform_cnt -= 1
-          end
-          test["report"]["actions"] << event
-        end
-        prompt = build_eval_prompt(test["eval"].to_s)
-        result_str = request(prompt, "test-app/output.png")
-        result = JSON.parse(result_str)
-        test["report"]["result"] = result
-        puts result_str
-        break if result["result"] == "pass"
+    @tests.to_a.each do |test|
+      prepare_test(test)
+      test["steps"].to_a.each do |step|
+        break unless run_step(step)
       end
+      test["report"]['actions'] = @events.zip(@flow).flatten.compact
+      run_eval(test)
+      test["report"]['result'] = @flow.last
     end
   end
 end
